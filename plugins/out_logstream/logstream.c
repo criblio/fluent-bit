@@ -32,16 +32,16 @@
 #include <stdlib.h>
 #include <assert.h>
 
-#include "tcp.h"
-#include "tcp_conf.h"
+#include "logstream.h"
+#include "logstream_conf.h"
 
-static int cb_tcp_init(struct flb_output_instance *ins,
+static int cb_logstream_init(struct flb_output_instance *ins,
                        struct flb_config *config, void *data)
 {
-    struct flb_out_tcp *ctx = NULL;
+    struct flb_out_logstream *ctx = NULL;
     (void) data;
 
-    ctx = flb_tcp_conf_create(ins, config);
+    ctx = flb_logstream_conf_create(ins, config);
     if (!ctx) {
         return -1;
     }
@@ -52,7 +52,7 @@ static int cb_tcp_init(struct flb_output_instance *ins,
     return 0;
 }
 
-static void cb_tcp_flush(const void *data, size_t bytes,
+static void cb_logstream_flush(const void *data, size_t bytes,
                          const char *tag, int tag_len,
                          struct flb_input_instance *i_ins,
                          void *out_context,
@@ -61,10 +61,12 @@ static void cb_tcp_flush(const void *data, size_t bytes,
     int ret = FLB_ERROR;
     size_t bytes_sent;
     flb_sds_t json = NULL;
+    flb_sds_t json_header = NULL;
     struct flb_upstream *u;
     struct flb_upstream_conn *u_conn;
-    struct flb_out_tcp *ctx = out_context;
+    struct flb_out_logstream *ctx = out_context;
     (void) i_ins;
+    char header[256];
 
     /* Get upstream context and connection */
     u = ctx->u;
@@ -76,23 +78,33 @@ static void cb_tcp_flush(const void *data, size_t bytes,
         FLB_OUTPUT_RETURN(FLB_RETRY);
     }
 
-    if (ctx->out_format == FLB_PACK_JSON_FORMAT_NONE) {
-        ret = flb_io_net_write(u_conn, data, bytes, &bytes_sent);
-    }
-    else {
-        json = flb_pack_msgpack_to_json_format(data, bytes,
-                                               ctx->out_format,
-                                               ctx->json_date_format,
-                                               ctx->date_key);
-        if (!json) {
-            flb_plg_error(ctx->ins, "error formatting JSON payload");
-            flb_upstream_conn_release(u_conn);
-            FLB_OUTPUT_RETURN(FLB_ERROR);
+    /* Send connection header to logstream on a new connection and if Auth Token is set */
+    if (ctx->auth_token) {
+        if (u_conn->ka_count == 0) {
+            snprintf(header, sizeof(header), "{\"authToken\": \"%s\"}\n", ctx->auth_token);
+            json_header = flb_sds_create(header);
+            ret = flb_io_net_write(u_conn, json_header, flb_sds_len(json_header), &bytes_sent);
+            flb_sds_destroy(json_header);
+            if (ret == -1) {
+                flb_errno();
+                flb_upstream_conn_release(u_conn);
+                FLB_OUTPUT_RETURN(FLB_RETRY);
+            }
         }
-        ret = flb_io_net_write(u_conn, json, flb_sds_len(json), &bytes_sent);
-        flb_sds_destroy(json);
     }
 
+    /* Format JSON payload and send data */
+    json = flb_pack_msgpack_to_json_format(data, bytes,
+            FLB_PACK_JSON_FORMAT_LINES,
+            FLB_PACK_JSON_DATE_DOUBLE,
+            NULL);
+    if (!json) {
+        flb_plg_error(ctx->ins, "error formatting JSON payload");
+        flb_upstream_conn_release(u_conn);
+        FLB_OUTPUT_RETURN(FLB_ERROR);
+    }
+    ret = flb_io_net_write(u_conn, json, flb_sds_len(json), &bytes_sent);
+    flb_sds_destroy(json);
     if (ret == -1) {
         flb_errno();
         flb_upstream_conn_release(u_conn);
@@ -103,34 +115,20 @@ static void cb_tcp_flush(const void *data, size_t bytes,
     FLB_OUTPUT_RETURN(FLB_OK);
 }
 
-static int cb_tcp_exit(void *data, struct flb_config *config)
+static int cb_logstream_exit(void *data, struct flb_config *config)
 {
-    struct flb_out_tcp *ctx = data;
+    struct flb_out_logstream *ctx = data;
 
-    flb_tcp_conf_destroy(ctx);
+    flb_logstream_conf_destroy(ctx);
     return 0;
 }
 
 /* Configuration properties map */
 static struct flb_config_map config_map[] = {
     {
-     FLB_CONFIG_MAP_STR, "format", "msgpack",
+     FLB_CONFIG_MAP_STR, "auth_token", "",
      0, FLB_FALSE, 0,
-     "Specify the payload format, supported formats: msgpack, json, "
-     "json_lines or json_stream."
-    },
-
-    {
-     FLB_CONFIG_MAP_STR, "json_date_format", "double",
-     0, FLB_FALSE, 0,
-     "Specify the format of the date, supported formats: double, iso8601 "
-     "(e.g: 2018-05-30T09:39:52.000681Z) and epoch."
-    },
-
-    {
-     FLB_CONFIG_MAP_STR, "json_date_key", "date",
-     0, FLB_TRUE, offsetof(struct flb_out_tcp, json_date_key),
-     "Specify the name of the date field in output."
+     "Specify an Auth Token if set in LogStream."
     },
 
     /* EOF */
@@ -138,12 +136,12 @@ static struct flb_config_map config_map[] = {
 };
 
 /* Plugin reference */
-struct flb_output_plugin out_tcp_plugin = {
-    .name           = "tcp",
-    .description    = "TCP Output",
-    .cb_init        = cb_tcp_init,
-    .cb_flush       = cb_tcp_flush,
-    .cb_exit        = cb_tcp_exit,
+struct flb_output_plugin out_logstream_plugin = {
+    .name           = "logstream",
+    .description    = "LogStream Output",
+    .cb_init        = cb_logstream_init,
+    .cb_flush       = cb_logstream_flush,
+    .cb_exit        = cb_logstream_exit,
     .config_map     = config_map,
     .flags          = FLB_OUTPUT_NET | FLB_IO_OPT_TLS,
 };
